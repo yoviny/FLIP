@@ -67,7 +67,8 @@ not uploadable, which is why the plan's provenance is recorded here rather than 
 ### Fast local iteration: the flwr simulator (`make sim-tutorial`)
 
 No containers; `flwr run` in flip-utils' environment, two simulated sites slicing one dev cohort.
-The GPU is used when present.
+When the host has a GPU each site gets an equal share of it (`SIM_NUM_GPUS=<fraction>` overrides,
+`SIM_NUM_GPUS=0` keeps the CPU — about ten times slower for this network).
 
 ```bash
 # 1. PI-CAI fold 0 (5 GB) -> the simulator layout for the first NUM_CASES studies (~1 min per 10)

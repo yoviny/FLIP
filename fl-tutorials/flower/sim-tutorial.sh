@@ -259,8 +259,22 @@ SITES="$(sed -n 's/^flip-min-clients[[:space:]]*=[[:space:]]*\([0-9]\{1,\}\).*/\
 if [ -z "$SITES" ]; then echo "❌ No flip-min-clients in $TUTORIAL/pyproject.toml"; exit 1; fi
 
 export LOCAL_DEV=true
+# GPU share per simulated site. Ray hands a ClientApp actor no GPU unless the federation config
+# asks (client-resources-num-gpus, default 0.0 in flwr's RayBackend), which leaves the 3-D
+# tutorials training on the CPU beside an idle GPU. Default: every site gets an equal fraction of
+# one GPU when nvidia-smi sees any, so the sites train concurrently on it; SIM_NUM_GPUS=<fraction
+# per site> overrides, SIM_NUM_GPUS=0 keeps the CPU.
+if [ -z "${SIM_NUM_GPUS:-}" ]; then
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+    SIM_NUM_GPUS="$(python3 -c "print(round(1 / $SITES, 2))")"
+  else
+    SIM_NUM_GPUS=0
+  fi
+fi
+FEDERATION_CONFIG="num-supernodes=$SITES client-resources-num-gpus=$SIM_NUM_GPUS"
+
 echo "🧪 Simulating Flower tutorial '$TUTORIAL' (flwr simulator — no containers)"
-echo "   sites=$SITES"
+echo "   sites=$SITES  gpu share per site=$SIM_NUM_GPUS"
 echo "   DEV_IMAGES_DIR=${DEV_IMAGES_DIR:-<unset: tabular-only tutorial>}"
 echo "   DEV_DATAFRAME=$DEV_DATAFRAME"
 echo "   WORKING_DIR=$WORKING_DIR"
@@ -279,7 +293,7 @@ STREAM="$(mktemp)"
 trap 'rm -f "$STREAM"' EXIT
 # A later --run-config on the command line overrides the same keys, so "$@" comes last.
 PYTHONUNBUFFERED=1 "${FLIP_UV[@]}" \
-  flwr run . local --federation-config "num-supernodes=$SITES" --stream \
+  flwr run . local --federation-config "$FEDERATION_CONFIG" --stream \
   ${RUN_CONFIG:+--run-config "$RUN_CONFIG"} "$@" 2>&1 | tee "$STREAM"
 RUN_ID="$(run_id_from "$STREAM")" || { echo "❌ flwr run printed no run id — was the run submitted?"; exit 1; }
 assert_run_completed "$RUN_ID"

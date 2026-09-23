@@ -9,11 +9,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from monai.data import PatchIterd
 from monai.transforms import (
     CenterSpatialCropd,
     Compose,
     NormalizeIntensityd,
-    PatchIterd,
     RandAxisFlipd,
     RandCoarseDropoutd,
     RandGaussianNoised,

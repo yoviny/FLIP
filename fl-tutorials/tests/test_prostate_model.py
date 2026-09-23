@@ -84,12 +84,21 @@ def prostate_app() -> dict[str, ModuleType]:
         del sys.modules[name]
     sys.path.insert(0, str(PROSTATE_DIR))
     try:
-        yield {name: importlib.import_module(f"app.{name}") for name in ("models", "task", "train_helpers")}
+        yield {
+            name: importlib.import_module(f"app.{name}")
+            for name in ("models", "task", "train_helpers", "preprocess", "data_loading", "client_app")
+        }
     finally:
         sys.path.remove(str(PROSTATE_DIR))
         for name in _app_modules():
             del sys.modules[name]
         sys.modules.update(displaced)
+
+
+def test_every_app_module_imports(prostate_app: dict[str, ModuleType]) -> None:
+    """The simulator loads app.client_app and everything under it; a bad import only shows up there."""
+    assert prostate_app["client_app"].app is not None
+    assert callable(prostate_app["preprocess"].build_patch_iter)
 
 
 def test_mini_plan_builds_the_planned_topology(prostate_app: dict[str, ModuleType]) -> None:

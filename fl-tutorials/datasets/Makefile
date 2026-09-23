@@ -193,7 +193,7 @@ partition-prostate-data:
 PROSTATE_LOCAL_FOLDS ?= 0
 prepare-prostate-local-data:
 	@$(MAKE) --no-print-directory download-prostate-data FOLDS="$(PROSTATE_LOCAL_FOLDS)"
-	@$(PROSTATE_UV) python prostate/prepare_prostate_local_data.py --data-dir $(abspath $(DATA_DIR))/prostate \
+	@PYTHONPATH=. $(PROSTATE_UV) python prostate/prepare_prostate_local_data.py --data-dir $(abspath $(DATA_DIR))/prostate \
 		$(if $(NUM_CASES),--num-cases $(NUM_CASES)) $(if $(PROSTATE_SITE_TREE),--site-tree $(abspath $(PROSTATE_SITE_TREE)))
 	@echo "✅ prostate simulator data ready — make -C fl-tutorials sim-tutorial TUTORIAL=3d_prostate_segmentation FL_BACKEND=flower"
 
