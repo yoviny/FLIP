@@ -166,9 +166,16 @@ planned on ZGT. Which site is the odd one out shifts with how many studies each 
 cannot be predicted from the centre alone. Pooling is a *planning-time* pooling of shape and
 intensity statistics only; no imaging leaves its site during training.
 
-**Provenance of the committed plan** (`app/nnUNetPlans_segmentation.json`): record the route
-(dcm2niix site tree or SimpleITK), the folds and site counts, `--gpu-memory-GB` and the date here
-whenever it is regenerated. _(To be filled in by the run that generates it.)_
+**Provenance of the committed plan** (`app/nnUNetPlans_segmentation.json`), regenerated 2026-09-23:
+the canonical dcm2niix route over the **full PI-CAI public cohort** — `download-prostate-data`
+(all five folds) → `convert-prostate-to-dicom` (t2w/adc/hbv) → `convert-prostate-to-nifti`
+(`ghcr.io/londonaicentre/xnat-dcm2niix:v1.0.20260724`) → `partition-prostate-data` → `make plan`
+pooled over `sites/{ZGT,PCNN,RUMC}` = 350 + 350 + 800 = 1500 studies, `--modality t2w`,
+`--gpu-memory-GB 8`. Result: median spacing `[3.0, 0.5, 0.5]`, median shape `[21, 383, 383]`, patch
+`[10, 192, 160]`, six stages `[32, 64, 128, 256, 320, 320]`, kernels `[1,3,3] [1,3,3] [3,3,3] ×4`,
+strides `[1,1,1] [1,2,2] [1,2,2] [2,2,2] [1,2,2] [1,2,2]`, foreground mean/std 215.6 / 120.4 — the
+pooled row of the table above. As a DynUNet that is 30.2 M parameters with four auxiliary outputs.
+Record the route, cohort, budget and date here whenever the plan is regenerated.
 
 ### From the plan to a MONAI network
 
