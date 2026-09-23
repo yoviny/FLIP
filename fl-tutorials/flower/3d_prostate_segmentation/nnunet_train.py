@@ -9,6 +9,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+# REFERENCE ONLY — the standalone (non-federated) nnU-Net trainer this tutorial's ClientApp was ported
+# from. It is kept for comparison and is not runnable on the platform: it needs nnunetv2 (`uv sync
+# --group planning`) and reads site folders, not a FLIP cohort. The federated version is app/client_app.py.
 # Adapted from
 # https://github.com/yoviny/MambaX-Net/blob/main/mambax_net/training/nnunet_train.py
 
@@ -40,17 +43,17 @@ from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 from torch.optim.lr_scheduler import PolynomialLR
 from torch.utils.data import ConcatDataset, DataLoader
 
-from dataset import PicaiDataset
-from network import (
-    build_network_architecture,
-    set_deep_supervision_enabled,
-)
-from preprocess import build_case_transform
-from train_helpers import (
+from app.dataset import PicaiDataset
+from app.preprocess import build_case_transform
+from app.train_helpers import (
     init_logger,
     possible_patch_size,
     seed_torch,
     train_seg,
+)
+from network import (
+    build_network_architecture,
+    set_deep_supervision_enabled,
 )
 
 SEED = 42

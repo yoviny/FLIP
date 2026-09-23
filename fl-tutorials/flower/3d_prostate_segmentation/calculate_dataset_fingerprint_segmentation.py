@@ -79,7 +79,7 @@ from nnunetv2.utilities.json_export import recursive_fix_for_json_export
 from torch.utils.data import ConcatDataset
 from tqdm import tqdm
 
-from dataset import PicaiDataset
+from app.dataset import PicaiDataset
 
 warnings.filterwarnings("ignore")
 

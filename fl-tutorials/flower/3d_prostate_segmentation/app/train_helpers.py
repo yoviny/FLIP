@@ -41,8 +41,8 @@ from monai.transforms import Activationsd, Compose, Invertd
 from scipy import stats
 from tqdm.auto import tqdm
 
-from dataset import IMAGE_KEY
-from network import set_deep_supervision_enabled
+from app.dataset import IMAGE_KEY
+from app.models import set_deep_supervision_enabled, split_deep_supervision_outputs
 
 
 class AverageMeter:
@@ -52,7 +52,8 @@ class AverageMeter:
     its only consumer. monai.metrics.CumulativeAverage is NOT a drop-in: it has no NaN-skipping
     branch and its aggregate() performs a distributed all-gather.
 
-    Note reset() allocates on .cuda(), so train_seg requires a GPU — upstream behaviour, preserved.
+    reset() used to allocate on the GPU (upstream behaviour); the port keeps the running values on the
+    CPU so train_seg runs on whatever device the model is on, GPU or not.
 
     Attributes:
         val (torch.Tensor): Most recently added value (a tensor at reset, a Python float after update() is called).
@@ -69,11 +70,11 @@ class AverageMeter:
 
     def reset(self) -> None:
         """Resets all statistics."""
-        self.val = torch.tensor(0.0).cuda()
-        self.avg = torch.tensor(0.0).cuda()
-        self.sum = torch.tensor(0.0).cuda()
-        self.count = torch.tensor(0).cuda()
-        self.nan_count = torch.tensor(0).cuda()
+        self.val = torch.tensor(0.0)
+        self.avg = torch.tensor(0.0)
+        self.sum = torch.tensor(0.0)
+        self.count = torch.tensor(0)
+        self.nan_count = torch.tensor(0)
 
     def update(self, val: torch.Tensor, n: int = 1) -> None:
         """Updates the meter with the new value.
@@ -315,7 +316,7 @@ def train_seg(
 
         amp_context = (
             torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-            if conf.get("bf16", True)
+            if conf.get("bf16", True) and device.type == "cuda"
             else nullcontext()
         )
         with amp_context:
@@ -325,7 +326,7 @@ def train_seg(
                 logits = model(image)
 
             if conf.get("deep_supervision", True):
-                pred_list = logits if isinstance(logits, (list, tuple)) else [logits]
+                pred_list = split_deep_supervision_outputs(logits)
                 loss = criterion(pred_list, _build_ds_targets(mask, pred_list))
                 logits = pred_list[0]
             else:
@@ -404,7 +405,7 @@ def train_seg(
                 logits = model(image)
 
             if conf.get("deep_supervision", True):
-                pred_list = logits if isinstance(logits, (list, tuple)) else [logits]
+                pred_list = split_deep_supervision_outputs(logits)
                 loss = criterion(pred_list, _build_ds_targets(mask, pred_list))
                 logits = pred_list[0]
             else:
@@ -842,7 +843,7 @@ def inference_func(
     models = []
     for file in glob.glob(f"{model_path}/{exp_name}_*.pt"):
         print(f"Loading {file} file")
-        state_dict = torch.load(file, map_location=torch.device(device))
+        state_dict = torch.load(file, map_location=torch.device(device), weights_only=True)
         model.load_state_dict(state_dict)
         if "nnunet" in exp_name:
             model = set_deep_supervision_enabled(False, False, model)
@@ -1166,7 +1167,7 @@ def generate_predictions(
     models = []
     for file in glob.glob(f"{model_path}/{exp_name}_*.pt"):
         print(f"Loading {file} file")
-        state_dict = torch.load(file, map_location=torch.device(device))
+        state_dict = torch.load(file, map_location=torch.device(device), weights_only=True)
         model.load_state_dict(state_dict)
         if "nnunet" in exp_name:
             model = set_deep_supervision_enabled(False, False, model)

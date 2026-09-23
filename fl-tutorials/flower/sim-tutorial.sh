@@ -204,17 +204,23 @@ case "$TUTORIAL" in
     # The MSD build both backends read, honouring NUM_CASES.
     export DEV_IMAGES_DIR="$DATA_ROOT/spleen/images"
     export DEV_DATAFRAME="$DATA_ROOT/spleen/dataframe.csv"
-    DATASET_TARGET=spleen ;;
+    DATASET_TARGET=download-spleen-data ;;
   xray_classification)
     export DEV_IMAGES_DIR="$DATA_ROOT/xrays_mini_300/accession-resources"
     export DEV_DATAFRAME="$DATA_ROOT/xrays_mini_300/dataframe.csv"
-    DATASET_TARGET=xray ;;
+    DATASET_TARGET=download-xray-data ;;
   ehr_risk_prediction)
     # Tabular-only tutorial: no images, so DEV_IMAGES_DIR stays unset (the app never reads it).
     # Every simulated site gets the same CSV; each ClientApp slices out its own person_id-modulo
     # partition, exactly as under the compose stack.
     export DEV_DATAFRAME="$DATA_ROOT/synthea/dataframe.csv"
-    DATASET_TARGET=synthea ;;
+    DATASET_TARGET=download-synthea-data ;;
+  3d_prostate_segmentation)
+    # The XNAT-export-shaped tree prepare_prostate_local_data.py writes from the PI-CAI download
+    # (three scans per study, masks beside each), honouring NUM_CASES.
+    export DEV_IMAGES_DIR="$DATA_ROOT/prostate/images"
+    export DEV_DATAFRAME="$DATA_ROOT/prostate/dataframe.csv"
+    DATASET_TARGET=prepare-prostate-local-data ;;
   *) echo "❌ No data mapping for '$TUTORIAL'"; exit 1 ;;
 esac
 REQUIRED=("$DEV_DATAFRAME")
@@ -231,7 +237,7 @@ fi
 for p in "${REQUIRED[@]}"; do
   if [ ! -e "$p" ]; then
     echo "❌ Dataset missing: $p"
-    echo "   Run: make -C fl-tutorials download-${DATASET_TARGET}-data"
+    echo "   Run: make -C fl-tutorials $DATASET_TARGET"
     exit 1
   fi
 done

@@ -9,6 +9,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+# REFERENCE ONLY — the standalone inference/metrics script paired with nnunet_train.py. Not runnable on
+# the platform (needs nnunetv2, reads site folders); app/task.py's evaluate_func is the federated equivalent.
 # Adapted from
 # https://github.com/yoviny/MambaX-Net/blob/main/mambax_net/inference/nnunet_infer.py
 
@@ -27,16 +29,16 @@ from monai.utils import set_determinism
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 from torch.utils.data import ConcatDataset, DataLoader
 
-from dataset import AXCODES, IMAGE_KEY, PicaiDataset
-from network import build_network_architecture
-from preprocess import build_case_transform
-from train_helpers import (
+from app.dataset import AXCODES, IMAGE_KEY, PicaiDataset
+from app.preprocess import build_case_transform
+from app.train_helpers import (
     generate_predictions,
     inference_func,
     init_logger,
     possible_patch_size,
     seed_torch,
 )
+from network import build_network_architecture
 
 
 def infer_loop():
