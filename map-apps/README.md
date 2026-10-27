@@ -24,14 +24,16 @@ packaging this way keeps a FLIP model portable rather than tied to one vendor.
 > **Status: design spike.** The path below has been verified end to end on a development
 > workstation. It produces a MAP that runs standalone — it is **not** a deployment procedure for
 > any specific platform, and the vendor-supported dependency versions differ from those used here.
-> See [`docs/source/working-with-flip-apps/package-model-as-map.rst`](../docs/source/working-with-flip-apps/package-model-as-map.rst)
-> for the full guide, the environment traps, and what remains open.
+> See [`docs/source/working-with-flip-apps/wrap-model-for-deployment.rst`](../docs/source/working-with-flip-apps/wrap-model-for-deployment.rst)
+> for the full guide and what remains open, and
+> [`map-toolchain-reference.rst`](../docs/source/working-with-flip-apps/map-toolchain-reference.rst) for the pinned
+> toolchain and the environment traps.
 
 ## Why these live here and not under each tutorial
 
 A MAP consumes trained **weights**, not federated-learning configuration, so it is *not*
 backend-specific — the same spleen MAP serves both `fl-tutorials/nvflare/…/3d_spleen_segmentation`
-and `fl-tutorials/flower/3d_spleen_segmentation`. Variation falls along two independent axes:
+and `fl-tutorials/flower/image_segmentation/3d_spleen_segmentation`. Variation falls along two independent axes:
 
 | Varies by **output type** — lives here | Varies by **model** — lives with the app |
 | --- | --- |

@@ -11,7 +11,7 @@
 # limitations under the License.
 #
 # Run one Flower tutorial on the flwr SIMULATOR — no SuperLink container, no SuperNodes, no
-# fl-api, no Docker; flwr starts a local SuperLink of its own on 127.0.0.1. The NVFLARE
+# fl-api, no Docker; flwr starts a local SuperLink of its own on 127.0.0.1. The FLARE
 # counterpart is `make sim` in each nvflare tutorial dir; this gives the Flower tutorials the
 # same fast local path.
 #
@@ -22,8 +22,8 @@
 # SuperNode accepts via --node-config), resolved by flip.flower.identity.client_identity,
 # so nothing in app/ knows which runtime it is in.
 #
-# For the container path — the pre-merge check that exercises TLS, fl-api submit and
-# SuperNode registration — use run-tutorial.sh instead.
+# The container path (the FL images, fl-api submit, SuperNode registration) is
+# `make e2e_smoke FL_BACKEND=flower` on the dev stack, as for FLARE (FLIP#1435).
 #
 # Exit status is the RUN's: 0 only when the SuperLink reports it finished:completed.
 set -euo pipefail
@@ -202,12 +202,33 @@ TUTORIAL="${1:-${TUTORIAL:-}}"
 # (e.g. --run-config 'num-server-rounds=1').
 [ $# -gt 0 ] && shift || true
 
-list() { for d in "$HERE"/*/app; do basename "$(dirname "$d")"; done; }
+list() { for d in "$HERE"/*/*/app; do basename "$(dirname "$d")"; done; }
 if [ -z "$TUTORIAL" ]; then echo "Set TUTORIAL=<name>. Available:"; list | sed 's/^/  - /'; exit 1; fi
-if [ ! -d "$HERE/$TUTORIAL/app" ]; then echo "❌ Unknown tutorial '$TUTORIAL'. Available:"; list | sed 's/^/  - /'; exit 1; fi
+# Tutorials live at <category>/<name> (#1500, the NVFLARE layout) and are addressed by <name>
+# alone — the data-mapping `case` below and every registration key on the bare name — so the
+# name is resolved to its directory here: exactly one match, never a path.
+if [[ "$TUTORIAL" == */* ]]; then echo "❌ Pass the tutorial name only, not a path: '$TUTORIAL'"; exit 1; fi
+TUTORIAL_DIR=""; MATCHES=0
+for d in "$HERE"/*/"$TUTORIAL"/app; do
+  [ -d "$d" ] || continue
+  MATCHES=$((MATCHES + 1)); TUTORIAL_DIR="$(dirname "$d")"
+done
+if [ "$MATCHES" -eq 0 ]; then echo "❌ Unknown tutorial '$TUTORIAL'. Available:"; list | sed 's/^/  - /'; exit 1; fi
+if [ "$MATCHES" -gt 1 ]; then
+  echo "❌ '$TUTORIAL' exists in several categories under fl-tutorials/flower/ — a tutorial name must be unique:"
+  for d in "$HERE"/*/"$TUTORIAL"/app; do [ -d "$d" ] && echo "  - $(dirname "${d#"$HERE"/}")"; done
+  exit 1
+fi
+# A checkout that pulled the #1500 move keeps ignored files (caches, a downloaded checkpoint) at the
+# old flat fl-tutorials/flower/<name>/; they are not tutorials, but they mislead `ls` and any
+# depth-one glob, so say so once and name the cleanup.
+for d in "$HERE"/*/app; do
+  [ -d "$d" ] || continue
+  echo "⚠️  Stale flat-layout leftover (ignored files from before #1500): $(dirname "$d") — remove with: git clean -fdX fl-tutorials/flower/$(basename "$(dirname "$d")")"
+done
 
-# Same per-tutorial dev data mapping as run-tutorial.sh — LOCAL_DEV reads these directly
-# instead of the bind mounts the compose stack would provide.
+# The per-tutorial dev data mapping — LOCAL_DEV reads these directly instead of the bind
+# mounts the fl-services/flower containers would provide.
 DATA_ROOT="${SIM_DATA_ROOT:-$REPO_ROOT/fl-tutorials/data}"
 # Run-config overrides the simulator has to supply in place of the platform's submit step.
 RUN_CONFIG=""
@@ -256,7 +277,7 @@ done
 
 # The ServerApp writes results under $WORKING_DIR (default "/app/runs" — the path inside a
 # SuperNode container, which does not exist and is not writable on the host). Point it at the
-# same host directory run-tutorial.sh uses, or the run trains fine and then dies with
+# host directory fl-services/flower mounts there, or the run trains fine and then dies with
 # PermissionError: '/app' at the results-writing step.
 export WORKING_DIR="${WORKING_DIR:-$REPO_ROOT/fl-services/flower/runs}"
 mkdir -p "$WORKING_DIR"
@@ -267,8 +288,8 @@ refuse_foreign_superlink "$CONTROL_PORT"
 
 # How many simulated sites, from the tutorial's own flip-min-clients so the two cannot drift.
 SITES="$(sed -n 's/^flip-min-clients[[:space:]]*=[[:space:]]*\([0-9]\{1,\}\).*/\1/p' \
-  "$HERE/$TUTORIAL/pyproject.toml" | head -1)"
-if [ -z "$SITES" ]; then echo "❌ No flip-min-clients in $TUTORIAL/pyproject.toml"; exit 1; fi
+  "$TUTORIAL_DIR/pyproject.toml" | head -1)"
+if [ -z "$SITES" ]; then echo "❌ No flip-min-clients in ${TUTORIAL_DIR#"$HERE"/}/pyproject.toml"; exit 1; fi
 
 export LOCAL_DEV=true
 # GPU share per simulated site. Ray hands a ClientApp actor no GPU unless the federation config
@@ -297,7 +318,7 @@ echo "   WORKING_DIR=$WORKING_DIR"
 # rides on --federation-config rather than a [tool.flwr.federations] block, because `flwr run`
 # migrates such a block into the user's ~/.flwr/config.toml and REWRITES the pyproject.toml to
 # comment it out (flwr/cli/config_migration.py) — which would dirty a tracked file every run.
-cd "$HERE/$TUTORIAL"
+cd "$TUTORIAL_DIR"
 # The streamed output is kept so the run id can be read back off it once the stream closes.
 # Through the pipe stdout is no longer a terminal, so PYTHONUNBUFFERED keeps the streamed log
 # lines arriving as they happen instead of block-buffered.

@@ -1,5 +1,19 @@
+# Copyright (c) 2026 Flower Labs GmbH
+# Copyright (c) 2026 Guy's and St Thomas' NHS Foundation Trust & King's College London
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#     http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
 import shutil
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import requests
@@ -8,7 +22,8 @@ from tomlkit import dumps, parse
 
 from fl_api.schemas import UploadAppRequest
 from fl_api.utils.logger import logger
-from fl_api.utils.validation import safe_join, validate_bundle_url
+from fl_api.utils.refusals import ResearcherRefusal
+from fl_api.utils.validation import redact_url, safe_join, validate_bundle_url
 
 
 def _key_after_model_id(url: str, model_id: str) -> Path:
@@ -60,14 +75,14 @@ def upsert_flwr_run_config(
     # defaults them to 2, so without this a single-trust run never starts a round: sample_nodes
     # polls in an UNBOUNDED sleep(1) loop, so the job hangs for good rather than timing out, and
     # the only trace is flwr's per-second "Waiting for nodes to connect" INFO line in the
-    # ServerApp log, which the platform does not surface. The NVFLARE adapter has always done
-    # the equivalent (config["min_clients"] = len(trusts) in configure_server).
+    # ServerApp log, which the platform does not surface. The FLARE adapter has always done
+    # the equivalent (each workflow's min_clients = len(trusts) in configure_server).
     doc["flip-min-clients"] = len(trusts)
 
     config_path.write_text(dumps(doc))
 
 
-def upload_application(model_id: str, body: UploadAppRequest, upload_dir: Path) -> dict[str, str]:
+def upload_application(model_id: str, body: UploadAppRequest, upload_dir: Path) -> dict[str, Any]:
     """
     Handles the logic of uploading an application to the server. This involves downloading the files uploaded by the
     user to a specific location on the server, and then returning a success message.
@@ -79,11 +94,12 @@ def upload_application(model_id: str, body: UploadAppRequest, upload_dir: Path) 
         upload_dir (Path): The base directory on the server where uploaded applications should be stored.
 
     Returns:
-        dict[str, str]: A dictionary containing a success message and the location where the application was uploaded.
+        dict[str, Any]: A success message naming where the application was uploaded, the GPU request the hub sent
+        (``resources``, None when none) and ``resources_enforced``, always False: Flower places no job by GPU (FLIP#70).
 
     Raises:
-        HTTPException: 400 if the request names no participating trusts, or a bundle URL is
-            rejected; 500 if a bundle file cannot be downloaded.
+        ResearcherRefusal: 400 if the request names no participating trusts.
+        HTTPException: 400 if a bundle URL is rejected; 500 if a bundle file cannot be downloaded.
     """
     logger.info(f"Received request to upload app: {model_id}")
 
@@ -96,9 +112,8 @@ def upload_application(model_id: str, body: UploadAppRequest, upload_dir: Path) 
     # the model, and keeps the previous bundle intact — the job dir is cleared further down.
     if not body.trusts:
         logger.error(f"Upload request for model {model_id} names no participating trusts")
-        raise HTTPException(
-            status_code=400,
-            detail="No participating trusts in the upload request: a run needs at least one trust to train on.",
+        raise ResearcherRefusal(
+            "No participating trusts in the upload request: a run needs at least one trust to train on."
         )
 
     # model_id is the Central Hub model UUID (validated as a UUID by the endpoint); it names
@@ -120,7 +135,7 @@ def upload_application(model_id: str, body: UploadAppRequest, upload_dir: Path) 
     logger.info(f"Downloading {len(bundle_urls)} files into job directory: {job_dir}")
 
     for url in bundle_urls:
-        logger.info(f"Downloading file from {url}")
+        logger.info(f"Downloading file from {redact_url(url)}")
 
         # The FL API fetches each URL server-side, so reject off-origin URLs. With no allow-list set the check
         # also resolves the name; requests resolves it again on connect, and that pair is the DNS-rebinding
@@ -138,7 +153,7 @@ def upload_application(model_id: str, body: UploadAppRequest, upload_dir: Path) 
                 # A redirect would dodge validate_bundle_url (which only saw the original URL),
                 # reopening the SSRF hole; treat any 3xx as a failure.
                 if resp.is_redirect or resp.is_permanent_redirect:
-                    raise HTTPException(status_code=400, detail=f"Bundle URL returned a redirect: {url!r}.")
+                    raise HTTPException(status_code=400, detail=f"Bundle URL returned a redirect: {redact_url(url)!r}.")
                 resp.raise_for_status()
                 with open(dest_path, "wb") as f:
                     for chunk in resp.iter_content(chunk_size=1024 * 1024):
@@ -147,8 +162,9 @@ def upload_application(model_id: str, body: UploadAppRequest, upload_dir: Path) 
         except HTTPException:
             raise  # propagate the 400 redirect rejection unchanged (not a generic download failure)
         except Exception as e:
-            logger.error(f"Failed to download file from {url} with error: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to download file from {url}: {e}")
+            message = f"Failed to download file from {redact_url(url)} ({type(e).__name__})."
+            logger.error(message)
+            raise HTTPException(status_code=500, detail=message) from None
 
         logger.info(f"Downloaded file {dest_path}")
 
@@ -168,7 +184,18 @@ def upload_application(model_id: str, body: UploadAppRequest, upload_dir: Path) 
 
     logger.info("config.toml updated with FLIP runtime parameters")
 
-    response = {"message": f"Application uploaded successfully to: {job_dir}"}
+    # Flower's deployment runtime places no job by GPU, and flwr rejects run-config keys an app does not
+    # declare, so the request is not injected anywhere: it is recorded and reported as not enforced (FLIP#70).
+    if body.resources is not None and body.resources.num_gpus:
+        logger.warning(
+            f"Model {model_id} asks for {body.resources.model_dump()} per site; Flower does not schedule by GPU, "
+            "so the request is recorded, not enforced"
+        )
+    response = {
+        "message": f"Application uploaded successfully to: {job_dir}",
+        "resources": body.resources.model_dump() if body.resources is not None else None,
+        "resources_enforced": False,
+    }
 
     logger.info(response)
 

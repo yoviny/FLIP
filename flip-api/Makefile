@@ -114,6 +114,13 @@ delete_testing_projects:
 seed_demo_projects:
 	@echo "🌱 Seeding the demo radiology project catalogue..."
 	env DB_HOST=localhost uv run python -m tests.seed_demo_projects $(EXTRA_ARGS)
+# Queue the approval-time cohort freeze (FLIP#857) at every approved trust of every APPROVED
+# project that has no snapshot record — projects approved before the feature are refused at
+# the trusts until they have one. Runs in the already-running flip-api container (exec, never
+# recreated). Preview with EXTRA_ARGS="--dry-run".
+backfill_cohort_snapshots:
+	@echo "🧊 Queuing missing cohort snapshots..."
+	$(docker_command) exec $(service_name) python -m flip_api.scripts.backfill_cohort_snapshots $(EXTRA_ARGS)
 # Provision the demo users for the demo-video recorder in the configured
 # identity provider (AUTH_BACKEND: the local Keycloak realm or the Cognito pool).
 # Runs inside the flip-api container so the provider is reached exactly as the
@@ -125,11 +132,11 @@ seed_demo_projects:
 # rather than `run`: no orphan
 # removal, so a running FL stack is left alone.
 create_demo_users:
-	$(docker_command) exec -e DEMO_RESEARCHER_PASSWORD -e DEMO_ADMIN_PASSWORD \
-		-e DEMO_RESEARCHER_EMAIL -e DEMO_ADMIN_EMAIL $(service_name) \
+	$(docker_command) exec -e DEMO_RESEARCHER_PASSWORD -e DEMO_ADMIN_PASSWORD -e DEMO_TRUST_ADMIN_PASSWORD \
+		-e DEMO_RESEARCHER_EMAIL -e DEMO_ADMIN_EMAIL -e DEMO_TRUST_ADMIN_EMAIL $(service_name) \
 		python -m flip_api.scripts.create_demo_users
-# Record the end-to-end demo video against the running dev stack (Dockerised
-# Cypress segments + off-camera waits + ffmpeg assembly). Args via DEMO_ARGS,
+# Record the end-to-end demo video against the running dev stack (Playwright
+# segments + off-camera waits + ffmpeg assembly). Args via DEMO_ARGS,
 # e.g. DEMO_ARGS="--skip-xnat" or DEMO_ARGS="--project-id <uuid> --from-segment 4".
 demo_video:
 	@echo "🎬 Recording the end-to-end demo video..."
@@ -141,12 +148,16 @@ demo_video:
 #
 # Defaults pick the chest-xray tutorial that matches FL_BACKEND so the same
 # `make e2e_smoke` invocation works against either stack. Both tutorials are
-# now in-tree under fl-tutorials/<backend>/ (NVFLARE at fl-tutorials/nvflare/,
+# now in-tree under fl-tutorials/<backend>/ (FLARE at fl-tutorials/nvflare/,
 # Flower at fl-tutorials/flower/). Both reuse the same query.sql
 # against the trust mock OMOP data. Default backend matches
 # deploy/fl_backend.mk (nvflare). Override either path explicitly:
 #     make e2e_smoke MODEL_FILES_DIR=/path/to/app_files
 #     make e2e_smoke QUERY_FILE=/path/to/your_cohort.sql
+# The x-ray query is picked automatically from HUB (see XRAY_QUERY_NAME below): a test trust
+# deployed without the OMOP vocabulary (the Helm chart's NO_VOCAB_LOAD=1, FLIP#1390) gets the
+# vocabulary-free copy, because there query.sql's concept joins return nothing and staging refuses
+# the project. Pass QUERY_FILE explicitly to override.
 # Anything else passed via EXTRA_ARGS goes straight to the script:
 #     make e2e_smoke EXTRA_ARGS="--image-pull-threshold 0.5"
 #
@@ -156,12 +167,17 @@ demo_video:
 # silently dropped enrichment and died at the zero-pairs guard minutes later.
 # TARGET_ARGS is the same idea for any other flag a variant target must pin (e.g. --no-imaging).
 FL_BACKEND ?= nvflare
+# A development stack (HUB unset) smokes the vocabulary-free copy of the cohort query: its trusts
+# carry only the DICOM vocabulary unless the licensed core vocabulary was loaded by hand, and
+# query.sql looks every concept up in omop.concept. Where the vocabulary is loaded the two return
+# the same rows. A deployed hub (HUB set) smokes query.sql.
+XRAY_QUERY_NAME := $(if $(strip $(HUB)),query.sql,query_novocab.sql)
 ifeq ($(FL_BACKEND),flower)
-MODEL_FILES_DIR ?= ../fl-tutorials/flower/xray_classification/app
-QUERY_FILE ?= ../fl-tutorials/flower/xray_classification/query.sql
+MODEL_FILES_DIR ?= ../fl-tutorials/flower/image_classification/xray_classification/app
+QUERY_FILE ?= ../fl-tutorials/flower/image_classification/xray_classification/$(XRAY_QUERY_NAME)
 else
 MODEL_FILES_DIR ?= ../fl-tutorials/nvflare/image_classification/xray_classification/app_files
-QUERY_FILE ?= $(MODEL_FILES_DIR)/../query.sql
+QUERY_FILE ?= $(MODEL_FILES_DIR)/../$(XRAY_QUERY_NAME)
 endif
 e2e_smoke:
 	@echo "🚀 Running e2e smoke (model files: $(MODEL_FILES_DIR), query: $(QUERY_FILE))..."
@@ -199,8 +215,8 @@ SPLEEN_LABELS_DIR ?= $(abspath ../fl-tutorials/data/spleen/images)
 SPLEEN_ENRICHMENT_CMD := uv run --no-project --with $(abspath ../flip-utils) python upload_spleen_labels_to_xnat.py --flip-project-id $$FLIP_PROJECT_ID --labels-dir $(SPLEEN_LABELS_DIR) $(foreach url,$(SPLEEN_XNAT_URLS),--xnat-url $(url))
 SPLEEN_ENRICHMENT_ARGS := --data-enrichment-cwd $(SPLEEN_ENRICHMENT_CWD) --data-enrichment-cmd '$(SPLEEN_ENRICHMENT_CMD)'
 
-e2e_smoke_spleen: MODEL_FILES_DIR := ../fl-tutorials/flower/3d_spleen_segmentation/app
-e2e_smoke_spleen: QUERY_FILE := ../fl-tutorials/flower/3d_spleen_segmentation/query.sql
+e2e_smoke_spleen: MODEL_FILES_DIR := ../fl-tutorials/flower/image_segmentation/3d_spleen_segmentation/app
+e2e_smoke_spleen: QUERY_FILE := ../fl-tutorials/flower/image_segmentation/3d_spleen_segmentation/query.sql
 e2e_smoke_spleen: ENRICHMENT_ARGS := $(SPLEEN_ENRICHMENT_ARGS)
 e2e_smoke_spleen: e2e_smoke
 
@@ -210,8 +226,8 @@ e2e_smoke_spleen: e2e_smoke
 # alongside the code -- the e2e smoke uploads it as part of the model files;
 # the fl-api writes it into /app/src/<model_id>/app/ on the shared FL_JOBS_DIR
 # mount; the evaluation ServerApp reads it via flip-job-dir at submit time.
-e2e_smoke_spleen_evaluation: MODEL_FILES_DIR := ../fl-tutorials/flower/3d_spleen_segmentation_evaluation/app
-e2e_smoke_spleen_evaluation: QUERY_FILE := ../fl-tutorials/flower/3d_spleen_segmentation/query.sql
+e2e_smoke_spleen_evaluation: MODEL_FILES_DIR := ../fl-tutorials/flower/image_evaluation/3d_spleen_segmentation_evaluation/app
+e2e_smoke_spleen_evaluation: QUERY_FILE := ../fl-tutorials/flower/image_segmentation/3d_spleen_segmentation/query.sql
 e2e_smoke_spleen_evaluation: ENRICHMENT_ARGS := $(SPLEEN_ENRICHMENT_ARGS)
 e2e_smoke_spleen_evaluation: e2e_smoke
 
@@ -220,7 +236,7 @@ e2e_smoke_spleen_evaluation: e2e_smoke
 # image-pull wait (FLIP#1071). TARGET_ARGS rather than EXTRA_ARGS so a command-line EXTRA_ARGS
 # (e.g. --project-id) cannot clobber the flag. Prereq: `make -C trust load-synthea-ehr` on every trust and,
 # if the EHR query was already submitted before that load, a data-access-api restart (results are cached by query text).
-EHR_FLOWER_DIR := ../fl-tutorials/flower/ehr_risk_prediction
+EHR_FLOWER_DIR := ../fl-tutorials/flower/tabular_classification/ehr_risk_prediction
 EHR_NVFLARE_DIR := ../fl-tutorials/nvflare/tabular_classification/ehr_risk_prediction
 e2e_smoke_ehr: MODEL_FILES_DIR := $(if $(filter flower,$(FL_BACKEND)),$(EHR_FLOWER_DIR)/app,$(EHR_NVFLARE_DIR)/app_files)
 e2e_smoke_ehr: QUERY_FILE := $(if $(filter flower,$(FL_BACKEND)),$(EHR_FLOWER_DIR)/query.sql,$(EHR_NVFLARE_DIR)/query.sql)
@@ -242,13 +258,13 @@ PROSTATE_ZONAL_LABELS_DIR ?= $(abspath ../fl-tutorials/data/prostate/zonal_label
 PROSTATE_ENRICHMENT_CMD := uv run --no-project --with $(abspath ../flip-utils) python upload_prostate_labels_to_xnat.py --flip-project-id $$FLIP_PROJECT_ID --labels-dir $(PROSTATE_LABELS_DIR) --zonal-labels-dir $(PROSTATE_ZONAL_LABELS_DIR) $(foreach url,$(PROSTATE_XNAT_URLS),--xnat-url $(url)) --require-full-coverage
 PROSTATE_ENRICHMENT_ARGS := --data-enrichment-cwd $(PROSTATE_ENRICHMENT_CWD) --data-enrichment-cmd '$(PROSTATE_ENRICHMENT_CMD)'
 
-e2e_smoke_prostate: MODEL_FILES_DIR := ../fl-tutorials/flower/3d_prostate_segmentation/app
-e2e_smoke_prostate: QUERY_FILE := ../fl-tutorials/flower/3d_prostate_segmentation/query.sql
+e2e_smoke_prostate: MODEL_FILES_DIR := ../fl-tutorials/flower/image_segmentation/3d_prostate_segmentation/app
+e2e_smoke_prostate: QUERY_FILE := ../fl-tutorials/flower/image_segmentation/3d_prostate_segmentation/query.sql
 e2e_smoke_prostate: ENRICHMENT_ARGS := $(PROSTATE_ENRICHMENT_ARGS)
 e2e_smoke_prostate: _require_flower_backend e2e_smoke
 
 # The prostate app exists for Flower only: fail before the ~6 min image pull rather than after it,
-# when an NVFLARE hub would reject the Flower bundle.
+# when a FLARE hub would reject the Flower bundle.
 _require_flower_backend:
 	@[ "$(FL_BACKEND)" = flower ] || { echo "❌ e2e_smoke_prostate uploads a Flower app — run it with FL_BACKEND=flower (got '$(FL_BACKEND)')"; exit 1; }
 

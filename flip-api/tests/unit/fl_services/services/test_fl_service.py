@@ -17,22 +17,26 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
 
+import boto3
+import httpx
 import pytest
+from moto import mock_aws
 
 from flip_api.config import Settings
-from flip_api.db.models.main_models import Trust
+from flip_api.db.models.main_models import FLJob, Trust
 from flip_api.domain.interfaces.fl import (
     IClientStatus,
     IJobMetaData,
+    IJobResources,
     IServerStatus,
     IStartTrainingBody,
 )
-from flip_api.domain.schemas.status import ClientStatus, JobStatus
+from flip_api.domain.schemas.status import ClientStatus, FLJobStatus, JobStatus
 from flip_api.domain.schemas.types import FLBackend
 from flip_api.fl_services.services import fl_service
 from flip_api.utils.encryption import PROJECT_ID_CONTEXT
 from flip_api.utils.exceptions import DatabaseError, JobAbortedError, NotFoundError
-from flip_api.utils.s3_client import PresignAudience
+from flip_api.utils.s3_client import PresignAudience, S3Client
 
 
 @pytest.fixture
@@ -111,6 +115,35 @@ def test_upload_app_calls_http_post(mock_post, model_id):
     mock_post.return_value = {"status": "ok"}
     result = fl_service.upload_app(model_id, body, "endpoint")
     assert result == {"status": "ok"}
+
+
+def _refusal(status_code: int, body) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "http://fl-api-net-1:8000/upload_app/m")
+    response = httpx.Response(status_code, request=request, json=body)
+    return httpx.HTTPStatusError(f"Client error '{status_code}'", request=request, response=response)
+
+
+def _upload_body() -> IStartTrainingBody:
+    return IStartTrainingBody(project_id="proj", cohort_query="query", trusts=["client1"], bundle_urls=[])
+
+
+@pytest.mark.parametrize(
+    ("status_code", "body"),
+    [
+        (400, {"refusal": "Choose a supported aggregator", "detail": "private path /app/src"}),
+        (400, {"detail": "Bundle URL returned a redirect: 'https://s3/b/f?X-Amz-Signature=private'."}),
+        (500, {"detail": "Internal server error: boom"}),
+    ],
+)
+@patch("flip_api.fl_services.services.fl_service.http_post")
+def test_upload_app_preserves_http_error_for_shared_refusal_handling(mock_post, status_code, body, model_id):
+    error = _refusal(status_code, body)
+    mock_post.side_effect = error
+
+    with pytest.raises(httpx.HTTPStatusError) as raised:
+        fl_service.upload_app(model_id, _upload_body(), "http://fl-api-net-1:8000")
+
+    assert raised.value is error
 
 
 def test_get_fl_backend_job_id_by_model_id(model_id, fake_session):
@@ -226,7 +259,7 @@ def test_validate_client_availability_flower_soft_on_unavailable(mock_get_status
 
 @patch("flip_api.fl_services.services.fl_service.check_client_status")
 def test_validate_client_availability_nvflare_still_raises(mock_get_status):
-    """NVFLARE backend: empty client statuses still raises ValueError."""
+    """FLARE backend: empty client statuses still raises ValueError."""
     mock_get_status.return_value = []
 
     with pytest.raises(ValueError, match="Unable to fetch client statuses"):
@@ -255,6 +288,8 @@ def test_start_training_with_config(
 ):
     mock_get_required.return_value = MagicMock(project_id="proj", cohort_query="query")
     mock_encrypt.return_value = "encrypted"
+    fake_session.get.return_value = FLJob(id=fl_job_id, model_id=model_id)  # no GPU override stored
+    fake_session.exec.return_value.one_or_none.return_value = JobStatus.IN_PROGRESS  # the job is still being prepared
 
     fl_service.start_training(
         model_id=model_id,
@@ -286,6 +321,7 @@ def test_start_training_skips_upload_when_job_already_deleted(
     # must fire before the (up to 900s) app transfer even starts.
     mock_get_required.return_value = MagicMock(project_id="proj", cohort_query="query")
     mock_encrypt.return_value = "encrypted"
+    fake_session.get.return_value = FLJob(id=fl_job_id, model_id=model_id)  # no GPU override stored
     fake_session.exec.return_value.one_or_none.return_value = JobStatus.DELETED
 
     with pytest.raises(JobAbortedError):
@@ -320,7 +356,43 @@ def test_start_training_skips_submit_when_job_deleted_during_upload(
     # run and stamps fl_backend_job_id onto the DELETED row).
     mock_get_required.return_value = MagicMock(project_id="proj", cohort_query="query")
     mock_encrypt.return_value = "encrypted"
+    fake_session.get.return_value = FLJob(id=fl_job_id, model_id=model_id)  # no GPU override stored
     fake_session.exec.return_value.one_or_none.side_effect = [JobStatus.IN_PROGRESS, JobStatus.DELETED]
+
+    with pytest.raises(JobAbortedError):
+        fl_service.start_training(
+            model_id=model_id,
+            fl_job_id=fl_job_id,
+            clients=["client1"],
+            endpoint="endpoint",
+            bundle_urls=["url"],
+            session=fake_session,
+        )
+
+    mock_upload.assert_called_once()
+    mock_submit.assert_not_called()
+
+
+@patch("flip_api.fl_services.services.fl_service.submit_job")
+@patch("flip_api.fl_services.services.fl_service.upload_app")
+@patch("flip_api.fl_services.services.fl_service.encrypt")
+@patch("flip_api.fl_services.services.fl_scheduler_service.get_required_training_details")
+def test_start_training_skips_submit_when_the_watchdog_completed_the_job(
+    mock_get_required,
+    mock_encrypt,
+    mock_upload,
+    mock_submit,
+    model_id,
+    fl_job_id,
+    fake_session,
+):
+    # The prepare outlived FL_JOB_PREPARE_TIMEOUT_MINUTES: the job watchdog (#727) set the model to ERROR, which
+    # marked the job COMPLETED and freed the net for the next job. A job that is no longer IN_PROGRESS must not
+    # reach the fl-server, or the failed model would train alongside the next one.
+    mock_get_required.return_value = MagicMock(project_id="proj", cohort_query="query")
+    mock_encrypt.return_value = "encrypted"
+    fake_session.get.return_value = FLJob(id=fl_job_id, model_id=model_id)  # no GPU override stored
+    fake_session.exec.return_value.one_or_none.side_effect = [JobStatus.IN_PROGRESS, JobStatus.COMPLETED]
 
     with pytest.raises(JobAbortedError):
         fl_service.start_training(
@@ -394,7 +466,7 @@ def test_bundle_nvflare_application_multi_site_template(
 ):
     """A per-site ``app_site-N/`` folder beside ``app/`` is bundled and populated like ``app/``.
 
-    The allowlist walk keeps NVFLARE's multi-site layout (FLIP#1008 review): both folders are
+    The allowlist walk keeps FLARE's multi-site layout (FLIP#1008 review): both folders are
     mirrored from the local tree, and the researcher's files land in each folder's ``custom/``.
     """
     base_dir = mocked_settings.FL_APP_BASE_DIR
@@ -445,7 +517,7 @@ def test_bundle_nvflare_application_diverts_eval_checkpoint(
     mock_s3, mock_required, mock_verify, mock_is_valid, job_type, model_id, mocked_settings
 ):
     """Evaluation checkpoints (plain and pre-rename-alias job types) are copied once to a
-    server-only ``server_checkpoints/`` prefix, NOT into any ``app*/custom/`` — so NVFLARE's
+    server-only ``server_checkpoints/`` prefix, NOT into any ``app*/custom/`` — so FLARE's
     deploy_map never ships them to clients."""
     base_dir = mocked_settings.FL_APP_BASE_DIR
     model_bucket = mocked_settings.SCANNED_MODEL_FILES_BUCKET
@@ -743,6 +815,13 @@ def test_bundle_flower_application_success(mock_s3, mock_required, mock_is_valid
             f"{model_bucket}/{model_id}/config.json",
         ],
         [],  # Destination bucket (clear check)
+        [
+            f"{dest_bucket}/{model_id}/app/server_app.py",
+            f"{dest_bucket}/{model_id}/pyproject.toml",
+            f"{dest_bucket}/{model_id}/app/client_app.py",
+            f"{dest_bucket}/{model_id}/app/models.py",
+            f"{dest_bucket}/{model_id}/app/config.json",
+        ],
     ]
     mock_client.copy_object.return_value = None
     mock_client.object_exists.return_value = False
@@ -794,6 +873,13 @@ def test_bundle_flower_application_model_files_overwrite(
     mock_client.list_objects.side_effect = [
         model_files,
         [],  # Destination bucket (clear check)
+        [
+            f"{dest_bucket}/{model_id}/app/server_app.py",
+            f"{dest_bucket}/{model_id}/pyproject.toml",
+            f"{dest_bucket}/{model_id}/app/client_app.py",
+            f"{dest_bucket}/{model_id}/app/models.py",
+            f"{dest_bucket}/{model_id}/app/config.json",
+        ],
     ]
     mock_client.copy_object.return_value = None
 
@@ -915,7 +1001,8 @@ def test_bundle_flower_application_wrong_files(mock_s3, mock_required, mocked_se
         _ = fl_service.bundle_flower_application(model_id)
 
 
-def test_verify_bundle_paths_success(model_id, mocked_settings):
+@pytest.mark.parametrize("checkpoint", [None, "weights.pt", "nested/pretrained.pt"])
+def test_verify_bundle_paths_success(model_id, mocked_settings, checkpoint):
     model_bucket = mocked_settings.SCANNED_MODEL_FILES_BUCKET
     dest_bucket = mocked_settings.FL_APP_DESTINATION_BUCKET
 
@@ -937,6 +1024,8 @@ def test_verify_bundle_paths_success(model_id, mocked_settings):
         f"{model_bucket_s3_path}/config.json",
         f"{model_bucket_s3_path}/meta.json",
     ]
+    if checkpoint:
+        model_files.append(f"{model_bucket_s3_path}/{checkpoint}")
 
     app_folders = {"app_site1", "app_site2"}
 
@@ -955,6 +1044,9 @@ def test_verify_bundle_paths_success(model_id, mocked_settings):
         rel = file.replace(f"{model_bucket_s3_path}/", "", 1)
         if rel == "meta.json":
             continue
+        if rel == checkpoint:
+            expected_dest_keys.add(f"{dest_bucket_s3_path}/server_checkpoints/{rel}")
+            continue
         for app in app_folders:
             expected_dest_keys.add(f"{dest_bucket_s3_path}/{app}/custom/{rel}")
 
@@ -964,14 +1056,111 @@ def test_verify_bundle_paths_success(model_id, mocked_settings):
     # Should not raise
     fl_service.verify_bundle_paths(
         s3=mock_s3,
+        fl_backend=FLBackend.NVFLARE,
         base_rel_paths=base_rel_paths,
         model_files=model_files,
         app_folders=app_folders,
         model_bucket_s3_path=model_bucket_s3_path,
         dest_bucket_s3_path=dest_bucket_s3_path,
+        server_checkpoints={checkpoint} if checkpoint else None,
     )
 
     mock_s3.list_objects.assert_called_once_with(dest_bucket_s3_path)
+
+
+@pytest.mark.parametrize(
+    ("backend", "root_file", "model_dir", "meta_path"),
+    [
+        (FLBackend.NVFLARE, "meta.json", "app/custom", "meta.json"),
+        (FLBackend.FLOWER, "pyproject.toml", "app", "app/meta.json"),
+    ],
+)
+@pytest.mark.parametrize("unexpected_path", [None, ".venv/pyvenv.cfg", "server_checkpoints/stale.pt"])
+@patch("flip_api.fl_services.services.fl_service.JobRequiredFiles.is_valid_job_type", return_value=True)
+@patch("flip_api.fl_services.services.fl_service.JobRequiredFiles.get_required_files")
+@patch("flip_api.fl_services.services.fl_service.S3Client")
+def test_bundle_application_verifies_exact_destination(
+    mock_s3,
+    mock_required,
+    mock_is_valid,
+    mocked_settings,
+    model_id,
+    backend,
+    root_file,
+    model_dir,
+    meta_path,
+    unexpected_path,
+):
+    """Both bundlers reject leftover objects, including undeclared server checkpoints."""
+    write_base_tree(mocked_settings.FL_APP_BASE_DIR, backend, "standard", ["app/server.py", root_file])
+    source = f"{mocked_settings.SCANNED_MODEL_FILES_BUCKET}/{model_id}"
+    destination = f"{mocked_settings.FL_APP_DESTINATION_BUCKET}/{model_id}"
+    model_files = [f"{source}/{rel}" for rel in ("config.json", "trainer.py", "meta.json")]
+    expected = {
+        f"{destination}/app/server.py",
+        f"{destination}/{root_file}",
+        f"{destination}/{model_dir}/config.json",
+        f"{destination}/{model_dir}/trainer.py",
+        f"{destination}/{meta_path}",
+    }
+    actual = expected | ({f"{destination}/{unexpected_path}"} if unexpected_path else set())
+    mock_client = mock_s3.return_value
+    mock_client.get_object.return_value = {
+        "Body": MagicMock(read=MagicMock(return_value=json.dumps({"job_type": "standard"}).encode("utf-8")))
+    }
+    mock_client.list_objects.side_effect = [model_files, [], sorted(actual)]
+    mock_client.object_exists.return_value = False
+    mock_required.return_value = ["config.json", "trainer.py"]
+    bundle = (
+        fl_service.bundle_nvflare_application if backend == FLBackend.NVFLARE else fl_service.bundle_flower_application
+    )
+
+    if unexpected_path:
+        with pytest.raises(RuntimeError, match="1 unexpected files") as error:
+            bundle(model_id)
+        assert f"{destination}/{unexpected_path}" in str(error.value)
+        assert "exactly the expected files" in str(error.value)
+    else:
+        assert bundle(model_id) == destination
+
+
+@mock_aws
+def test_bundle_verification_and_cleanup_cover_keys_after_first_s3_page(monkeypatch):
+    """A stale 1,001st key is rejected; a legitimate large bundle can be listed and cleared."""
+    for variable in ("AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3"):
+        monkeypatch.delenv(variable, raising=False)
+    boto = boto3.client("s3", region_name="us-east-1")
+    boto.create_bucket(Bucket="large-bundle")
+    base_rel_paths = [f"app/file{i:04d}.py" for i in range(1000)]
+    for rel in base_rel_paths:
+        boto.put_object(Bucket="large-bundle", Key=f"model/{rel}", Body=b"x")
+    settings = MagicMock(AWS_REGION="us-east-1", S3_PUBLIC_ENDPOINT_URL=None)
+    with patch("flip_api.utils.s3_client.get_settings", return_value=settings):
+        s3 = S3Client()
+        destination = "s3://large-bundle/model"
+        verification = {
+            "s3": s3,
+            "fl_backend": FLBackend.NVFLARE,
+            "base_rel_paths": base_rel_paths,
+            "model_files": [],
+            "app_folders": {"app"},
+            "model_bucket_s3_path": "s3://source/model",
+            "dest_bucket_s3_path": destination,
+        }
+        stale_key = "model/zzz-stale.py"
+        boto.put_object(Bucket="large-bundle", Key=stale_key, Body=b"stale")
+        with pytest.raises(RuntimeError, match="1 unexpected files") as error:
+            fl_service.verify_bundle_paths(**verification)
+        assert f"s3://large-bundle/{stale_key}" in str(error.value)
+
+        result = s3.delete_objects(s3.list_objects(destination))
+        assert len(result["large-bundle"]["Deleted"]) == 1001
+        assert s3.list_objects(destination) == []
+        base_rel_paths.append("app/file1000.py")
+        for rel in base_rel_paths:
+            boto.put_object(Bucket="large-bundle", Key=f"model/{rel}", Body=b"rerun")
+        fl_service.verify_bundle_paths(**verification)
+        assert len(fl_service.get_bundle_urls(destination)) == 1001
 
 
 def test_verify_bundle_paths_raises_on_missing_file(model_id, mocked_settings):
@@ -1016,6 +1205,7 @@ def test_verify_bundle_paths_raises_on_missing_file(model_id, mocked_settings):
     with pytest.raises(RuntimeError, match=r"missing files"):
         fl_service.verify_bundle_paths(
             s3=mock_s3,
+            fl_backend=FLBackend.NVFLARE,
             base_rel_paths=base_rel_paths,
             model_files=model_files,
             app_folders=app_folders,
@@ -1127,6 +1317,26 @@ def test_extract_current_job_data_not_found_returns_none(mock_http_get):
 
 
 @patch("flip_api.fl_services.services.fl_service.http_get")
+def test_extract_current_job_data_returns_a_job_still_waiting_to_start(mock_http_get):
+    # A job the backend has not started yet (FLARE waiting for a trust's resources) is aborted too. Left
+    # queued, it could still start later, or report to a model the user has since queued again (#1390).
+    mock_http_get.return_value = [{"job_id": "job123", "status": "PENDING"}]
+
+    result = fl_service.extract_current_job_data("http://fl-api-endpoint", "job123")
+
+    assert result is not None
+    assert result.status == "PENDING"
+
+
+@pytest.mark.parametrize("status", ["FINISHED", "FAILED", "STOPPED"])
+@patch("flip_api.fl_services.services.fl_service.http_get")
+def test_extract_current_job_data_ignores_a_job_that_has_ended(mock_http_get, status):
+    mock_http_get.return_value = [{"job_id": "job123", "status": status}]
+
+    assert fl_service.extract_current_job_data("http://fl-api-endpoint", "job123") is None
+
+
+@patch("flip_api.fl_services.services.fl_service.http_get")
 def test_extract_current_job_data_multiple_found(mock_http_get):
     from flip_api.fl_services.services.fl_service import extract_current_job_data
 
@@ -1140,6 +1350,59 @@ def test_extract_current_job_data_multiple_found(mock_http_get):
 
     with pytest.raises(ValueError, match="Multiple running jobs found"):
         extract_current_job_data(net_endpoint, fl_backend_job_id)
+
+
+@patch("flip_api.fl_services.services.fl_service.http_get")
+def test_list_backend_jobs_parses_every_job(mock_http_get):
+    from flip_api.fl_services.services.fl_service import list_backend_jobs
+
+    mock_http_get.return_value = [
+        {"job_id": "a", "status": "RUNNING"},
+        {"job_id": "b", "status": "FAILED"},
+    ]
+
+    jobs = list_backend_jobs("http://fl-api")
+
+    assert jobs is not None
+    assert [(j.job_id, j.status) for j in jobs] == [("a", FLJobStatus.RUNNING), ("b", FLJobStatus.FAILED)]
+    mock_http_get.assert_called_once_with("http://fl-api/list_jobs", timeout=30)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        httpx.ConnectError("connection refused"),
+        httpx.HTTPStatusError(
+            "500 Internal Server Error",
+            request=httpx.Request("GET", "http://fl-api/list_jobs"),
+            response=httpx.Response(500),
+        ),
+    ],
+)
+@patch("flip_api.fl_services.services.fl_service.http_get")
+def test_list_backend_jobs_returns_none_when_the_fl_api_cannot_answer(mock_http_get, failure):
+    from flip_api.fl_services.services.fl_service import list_backend_jobs
+
+    mock_http_get.side_effect = failure
+
+    assert list_backend_jobs("http://fl-api") is None
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Internal Server Error",
+        {"detail": "not a list"},
+        [{"job_id": "a", "status": "EXPLODED"}],
+    ],
+)
+@patch("flip_api.fl_services.services.fl_service.http_get")
+def test_list_backend_jobs_returns_none_for_a_malformed_reply(mock_http_get, body):
+    from flip_api.fl_services.services.fl_service import list_backend_jobs
+
+    mock_http_get.return_value = body
+
+    assert list_backend_jobs("http://fl-api") is None
 
 
 @patch("flip_api.fl_services.services.fl_service.extract_current_job_data")
@@ -1165,11 +1428,7 @@ def test_abort_model_training_success(
     mock_fetch_server_status.return_value = {"status": "stopped"}
     mock_extract_current_job_data.return_value = IJobMetaData(job_id="job123", status="RUNNING")
 
-    request = MagicMock()
-    request.scope = {"request_id": "req-id"}
-    request.path_params = {"target": "server", "clients": None}
-
-    fl_service.abort_model_training(request, model_id, fake_session)
+    fl_service.abort_model_training(model_id, fake_session)
     mock_abort.assert_called_once_with("http://fl-api-endpoint", "job123")
     # The dequeue DELETEs the job, so update_fl_scheduler can no longer free the net —
     # the abort path must release it itself once the abort has been delivered.
@@ -1199,13 +1458,40 @@ def test_abort_model_training_idempotent_when_no_running_job(
     mock_fetch_server_status.return_value = {"status": "stopped"}
     mock_extract_current_job_data.return_value = None
 
-    request = MagicMock()
-    request.scope = {"request_id": "req-id"}
-    request.path_params = {"target": "server", "clients": None}
-
     # No running job -> idempotent no-op: must not raise and must not call abort_job.
-    fl_service.abort_model_training(request, model_id, fake_session)
+    fl_service.abort_model_training(model_id, fake_session)
     mock_abort.assert_not_called()
+    mock_release.assert_called_once_with(model_id, fake_session)
+
+
+@patch("flip_api.fl_services.services.fl_service.http_get")
+@patch("flip_api.fl_services.services.fl_service.get_fl_backend_job_id_by_model_id")
+@patch("flip_api.fl_services.services.fl_service.fetch_server_status")
+@patch("flip_api.fl_services.services.fl_service.abort_job")
+@patch("flip_api.fl_services.services.fl_scheduler_service.get_net_by_model_id")
+@patch("flip_api.fl_services.services.fl_scheduler_service.remove_job_from_queue")
+@patch("flip_api.fl_services.services.fl_scheduler_service.release_scheduler_for_model")
+def test_abort_model_training_aborts_a_job_still_waiting_to_start(
+    mock_release,
+    mock_remove,
+    mock_get_net,
+    mock_abort,
+    mock_fetch_server_status,
+    mock_get_fl_backend_job_id_by_model_id,
+    mock_http_get,
+    model_id,
+    fake_session,
+):
+    # FLARE holds a job no trust has the resources for; Abort job must take it out of FLARE's queue, or
+    # its reporter can still set the model to ERROR after the user queues the model again (#1390).
+    mock_get_fl_backend_job_id_by_model_id.return_value = "job123"
+    mock_get_net.return_value = MagicMock(endpoint="http://fl-api-endpoint", name="net1")
+    mock_fetch_server_status.return_value = {"status": "started"}
+    mock_http_get.return_value = [{"job_id": "job123", "status": "PENDING"}]
+
+    fl_service.abort_model_training(model_id, fake_session)
+
+    mock_abort.assert_called_once_with("http://fl-api-endpoint", "job123")
     mock_release.assert_called_once_with(model_id, fake_session)
 
 
@@ -1297,6 +1583,56 @@ def test_check_server_status_returns_none_when_no_response(mock_http_get):
     assert fl_service.check_server_status("endpoint") is None
 
 
+def _fl_api_unreachable() -> httpx.HTTPError:
+    return httpx.RequestError("connection refused")
+
+
+def _fl_api_answers_500() -> httpx.HTTPError:
+    # FLARE's FL API answers 500 from its catch-all handler when the fl-server behind it is down.
+    request = httpx.Request("GET", "http://fl-api/check_server_status")
+    return httpx.HTTPStatusError("500 Internal Server Error", request=request, response=httpx.Response(500))
+
+
+FL_API_FAILURES = pytest.mark.parametrize(
+    "error_factory", [_fl_api_unreachable, _fl_api_answers_500], ids=["fl-api-unreachable", "fl-api-answers-500"]
+)
+
+
+@FL_API_FAILURES
+@patch("flip_api.fl_services.services.fl_service.http_get")
+def test_check_server_status_returns_none_when_request_fails(mock_http_get, error_factory):
+    mock_http_get.side_effect = error_factory()
+
+    assert fl_service.check_server_status("endpoint") is None
+
+
+@FL_API_FAILURES
+@patch("flip_api.fl_services.services.fl_service.http_get")
+def test_check_client_status_returns_none_when_request_fails(mock_http_get, error_factory):
+    mock_http_get.side_effect = error_factory()
+
+    assert fl_service.check_client_status("endpoint") is None
+
+
+@pytest.mark.parametrize(
+    ("error_factory", "expected_error_logs"),
+    [(_fl_api_unreachable, 0), (_fl_api_answers_500, 1)],
+    ids=["fl-api-unreachable", "fl-api-answers-500"],
+)
+@pytest.mark.parametrize(
+    "check", [fl_service.check_server_status, fl_service.check_client_status], ids=["server", "client"]
+)
+@patch("flip_api.fl_services.services.fl_service.logger")
+@patch("flip_api.fl_services.services.fl_service.http_get")
+def test_check_status_logs_a_failed_request_once(mock_http_get, mock_logger, check, error_factory, expected_error_logs):
+    # http_get logs a RequestError itself before re-raising it, so logging it here too would print the same
+    # line twice on every status poll; an error response is not logged by http_get, so it is logged here.
+    mock_http_get.side_effect = error_factory()
+
+    assert check("endpoint") is None
+    assert mock_logger.error.call_count == expected_error_logs
+
+
 @patch("flip_api.fl_services.services.fl_service.http_get")
 def test_check_client_status_success(mock_http_get):
     mock_http_get.return_value = [
@@ -1374,7 +1710,7 @@ def test_bundle_nvflare_application_missing_root_file(mock_s3, mock_is_valid, mo
     """A template with ``app/`` files but no ``meta.json`` is rejected at bundle time.
 
     Without this guard the bundle uploads cleanly and only fails at the FL server, far from the
-    cause — NVFLARE has no job definition to deploy.
+    cause — FLARE has no job definition to deploy.
     """
     base_dir = mocked_settings.FL_APP_BASE_DIR
     model_bucket = mocked_settings.SCANNED_MODEL_FILES_BUCKET
@@ -1500,7 +1836,7 @@ def test_bundle_nvflare_application_clears_existing_dest(
 @patch("flip_api.fl_services.services.fl_service.JobRequiredFiles.get_required_files")
 @patch("flip_api.fl_services.services.fl_service.S3Client")
 def test_bundle_nvflare_application_missing_config_json_is_rejected(mock_s3, mock_required, mocked_settings, model_id):
-    """config.json is a required NVFLARE file, so a submission without one never reaches a Trust.
+    """config.json is a required FLARE file, so a submission without one never reaches a Trust.
 
     The bundler refuses at the guard — before clearing the destination bucket — instead of logging
     a doomed ``job_type=standard`` guess that the required-files check would reject moments later.
@@ -1706,7 +2042,17 @@ def test_bundle_flower_application_clears_existing_dest(
         f"{model_bucket}/{model_id}/models.py",
     ]
     stale_dest_files = [f"{dest_bucket}/{model_id}/stale.py"]
-    mock_client.list_objects.side_effect = [model_files, stale_dest_files]
+    mock_client.list_objects.side_effect = [
+        model_files,
+        stale_dest_files,
+        [
+            f"{dest_bucket}/{model_id}/app/server_app.py",
+            f"{dest_bucket}/{model_id}/pyproject.toml",
+            f"{dest_bucket}/{model_id}/app/client_app.py",
+            f"{dest_bucket}/{model_id}/app/models.py",
+            f"{dest_bucket}/{model_id}/app/config.json",
+        ],
+    ]
     mock_client.object_exists.return_value = False
 
     result = fl_service.bundle_flower_application(model_id)
@@ -1811,10 +2157,7 @@ def test_abort_model_training_pre_submit_frees_net(
     # fl-server, so fl_backend_job_id is still NULL and the backend-job-id lookup raises.
     mock_get_fl_backend_job_id_by_model_id.side_effect = ValueError("No FL backend job ID found")
 
-    request = MagicMock()
-    request.path_params = {}
-
-    fl_service.abort_model_training(request, model_id, fake_session)
+    fl_service.abort_model_training(model_id, fake_session)
 
     # The job is dequeued and the BUSY net released immediately — not left for the watchdog.
     mock_remove.assert_called_once_with(model_id, fake_session)
@@ -1848,10 +2191,7 @@ def test_abort_model_training_pre_pickup_net_not_found_frees_net(
     mock_get_fl_backend_job_id_by_model_id.return_value = "job-1"
     mock_get_net.side_effect = NotFoundError(f"Net not found for model ID: {model_id}")
 
-    request = MagicMock()
-    request.path_params = {}
-
-    fl_service.abort_model_training(request, model_id, fake_session)
+    fl_service.abort_model_training(model_id, fake_session)
 
     mock_remove.assert_called_once_with(model_id, fake_session)
     mock_release.assert_called_once_with(model_id, fake_session)
@@ -1883,11 +2223,8 @@ def test_abort_model_training_db_error_propagates(
     # the job is still queued).
     mock_remove.side_effect = DatabaseError("Error removing job from queue")
 
-    request = MagicMock()
-    request.path_params = {}
-
     with pytest.raises(DatabaseError, match="Error removing job from queue"):
-        fl_service.abort_model_training(request, model_id, fake_session)
+        fl_service.abort_model_training(model_id, fake_session)
 
     mock_release.assert_not_called()
     mock_fetch_server_status.assert_not_called()
@@ -1916,47 +2253,14 @@ def test_abort_model_training_raises_when_server_not_running(
     mock_get_net.return_value = MagicMock(endpoint="http://fl-api-endpoint", name="net1")
     mock_fetch_server_status.return_value = None  # FL server is down
 
-    request = MagicMock()
-    request.path_params = {"target": "server", "clients": None}
-
     with pytest.raises(ValueError, match="FL Server not running"):
-        fl_service.abort_model_training(request, model_id, fake_session)
+        fl_service.abort_model_training(model_id, fake_session)
 
     # The abort must short-circuit before consulting the job list or issuing an abort.
     mock_extract_current_job_data.assert_not_called()
     mock_abort.assert_not_called()
     # The abort was never delivered, so the net must NOT be released — the job may still be live.
     mock_release.assert_not_called()
-
-
-@patch("flip_api.fl_services.services.fl_service.extract_current_job_data")
-@patch("flip_api.fl_services.services.fl_service.get_fl_backend_job_id_by_model_id")
-@patch("flip_api.fl_services.services.fl_service.fetch_server_status")
-@patch("flip_api.fl_services.services.fl_service.abort_job")
-@patch("flip_api.fl_services.services.fl_scheduler_service.get_net_by_model_id")
-@patch("flip_api.fl_services.services.fl_scheduler_service.remove_job_from_queue")
-def test_abort_model_training_raises_on_invalid_target(
-    mock_remove,
-    mock_get_net,
-    mock_abort,
-    mock_fetch_server_status,
-    mock_get_fl_backend_job_id_by_model_id,
-    mock_extract_current_job_data,
-    model_id,
-    fake_session,
-):
-    mock_get_fl_backend_job_id_by_model_id.return_value = "job123"
-    mock_get_net.return_value = MagicMock(endpoint="http://fl-api-endpoint", name="net1")
-    mock_fetch_server_status.return_value = {"status": "started"}
-    mock_extract_current_job_data.return_value = IJobMetaData(job_id="job123", status="RUNNING")
-
-    request = MagicMock()
-    request.path_params = {"target": "bogus-target", "clients": None}
-
-    with pytest.raises(ValueError, match="Invalid target: bogus-target"):
-        fl_service.abort_model_training(request, model_id, fake_session)
-
-    mock_abort.assert_not_called()
 
 
 # --- local base-file helper + local-directory bundling edge cases (FLIP#724) ----------------------
@@ -2263,7 +2567,7 @@ def test_every_backend_has_bundling_rules(fl_backend):
 
 
 def test_list_local_base_files_root_file_is_per_backend(tmp_path):
-    # Each backend keeps exactly one root file: NVFLARE's job definition, Flower's FAB definition.
+    # Each backend keeps exactly one root file: FLARE's job definition, Flower's FAB definition.
     # The other backend's is not deployable here and must not ride along.
     base = tmp_path / "base"
     (base / "app").mkdir(parents=True)
@@ -2276,9 +2580,9 @@ def test_list_local_base_files_root_file_is_per_backend(tmp_path):
 
 
 def _multi_site_template(tmp_path: Path) -> Path:
-    """An NVFLARE-style template with per-site app variants beside ``app/``.
+    """A FLARE-style template with per-site app variants beside ``app/``.
 
-    ``meta.json``'s ``deploy_map`` names each folder and NVFLARE deploys it to the sites listed —
+    ``meta.json``'s ``deploy_map`` names each folder and FLARE deploys it to the sites listed —
     the layout ``bundle_nvflare_application`` scans for and fl-api-base's job assembly documents.
     """
     base = tmp_path / "base"
@@ -2294,7 +2598,7 @@ def _multi_site_template(tmp_path: Path) -> Path:
 
 
 def test_list_local_base_files_keeps_nvflare_per_site_app_folders(tmp_path):
-    # NVFLARE's multi-site layout is a documented capability (app_site-N folders named in
+    # FLARE's multi-site layout is a documented capability (app_site-N folders named in
     # meta.json's deploy_map), so the allowlist must keep app_* beside app/ — the positional rule
     # is "an app folder", not "a directory literally named app".
     base = _multi_site_template(tmp_path)
@@ -2537,3 +2841,115 @@ class TestRealRequiredFilesManifests:
             "config.json",
             "models.py",
         ]
+
+
+# ── GPU request (FLIP#70) ───────────────────────────────────────────────────────────
+
+
+def test_add_fl_job_stores_a_gpu_override(model_id, fake_session):
+    fl_service.add_fl_job(model_id, [], fake_session, resources=IJobResources(num_gpus=1))
+
+    job = fake_session.add.call_args.args[0]
+    assert job.num_gpus == 1
+
+
+def test_add_fl_job_without_an_override_leaves_the_column_null(model_id, fake_session):
+    fl_service.add_fl_job(model_id, [], fake_session)
+
+    job = fake_session.add.call_args.args[0]
+    assert job.num_gpus is None
+
+
+def _start(model_id, fl_job_id, fake_session, job, upload_reply=None):
+    """Run start_training against a stored job row; return what was uploaded and what was logged."""
+    fake_session.get.return_value = job
+    fake_session.exec.return_value.one_or_none.return_value = JobStatus.IN_PROGRESS  # the job is still being prepared
+    with (
+        patch("flip_api.fl_services.services.fl_service.submit_job"),
+        patch("flip_api.fl_services.services.fl_service.upload_app", return_value=upload_reply) as upload,
+        patch("flip_api.fl_services.services.fl_service.encrypt", return_value="encrypted"),
+        patch(
+            "flip_api.fl_services.services.fl_scheduler_service.get_required_training_details",
+            return_value=MagicMock(project_id="proj", cohort_query="query"),
+        ),
+        patch("flip_api.model_services.services.model_service.add_log") as add_log,
+    ):
+        fl_service.start_training(model_id, fl_job_id, ["Trust_1"], "endpoint", ["url"], fake_session)
+    return upload.call_args.args[1], [(c.args[1], c.kwargs.get("success", True)) for c in add_log.call_args_list]
+
+
+def test_start_training_sends_the_runs_override_to_the_fl_api(model_id, fl_job_id, fake_session):
+    job = FLJob(id=fl_job_id, model_id=model_id, num_gpus=2)
+
+    body, _ = _start(model_id, fl_job_id, fake_session, job)
+
+    assert body.resources == IJobResources(num_gpus=2)
+
+
+def test_start_training_without_an_override_sends_none(model_id, fl_job_id, fake_session):
+    body, _ = _start(model_id, fl_job_id, fake_session, FLJob(id=fl_job_id, model_id=model_id))
+
+    assert body.resources is None
+
+
+def test_start_training_logs_the_request_the_fl_api_applied_and_where_it_came_from(model_id, fl_job_id, fake_session):
+    reply = {"message": "ok", "resources": {"num_gpus": 1}, "resources_source": "meta.json"}
+
+    _, logged = _start(model_id, fl_job_id, fake_session, FLJob(id=fl_job_id, model_id=model_id), reply)
+
+    assert ("GPU request per trust: 1 GPU (from the job's meta.json)", True) in logged
+
+
+def test_start_training_logs_the_platform_default_gpu_request(model_id, fl_job_id, fake_session):
+    reply = {"message": "ok", "resources": {"num_gpus": 0}, "resources_source": "default"}
+
+    _, logged = _start(model_id, fl_job_id, fake_session, FLJob(id=fl_job_id, model_id=model_id), reply)
+
+    assert ("GPU request per trust: no GPU (the platform default)", True) in logged
+
+
+def test_start_training_logs_a_cpu_only_override(model_id, fl_job_id, fake_session):
+    job = FLJob(id=fl_job_id, model_id=model_id, num_gpus=0)
+    reply = {"message": "ok", "resources": {"num_gpus": 0}, "resources_source": "submission"}
+
+    _, logged = _start(model_id, fl_job_id, fake_session, job, reply)
+
+    assert ("GPU request per trust: no GPU (set for this run)", True) in logged
+
+
+@patch("flip_api.fl_services.services.fl_service.logger")
+def test_start_training_skips_the_log_for_an_unreadable_gpu_request(mock_logger, model_id, fl_job_id, fake_session):
+    reply = {"message": "ok", "resources": {"num_gpus": "lots"}}
+
+    _, logged = _start(model_id, fl_job_id, fake_session, FLJob(id=fl_job_id, model_id=model_id), reply)
+
+    assert logged == []
+    assert "Unreadable GPU request" in mock_logger.warning.call_args.args[0]
+
+
+def test_start_training_says_when_flower_records_but_does_not_enforce_the_request(model_id, fl_job_id, fake_session):
+    job = FLJob(id=fl_job_id, model_id=model_id, num_gpus=1)
+    reply = {"message": "ok", "resources": {"num_gpus": 1}, "resources_enforced": False}
+
+    _, logged = _start(model_id, fl_job_id, fake_session, job, reply)
+
+    assert (
+        "GPU request per trust: 1 GPU, recorded but not enforced: Flower does not schedule jobs by GPU",
+        False,
+    ) in logged
+
+
+def test_start_training_warns_when_the_fl_api_ignored_an_override(model_id, fl_job_id, fake_session):
+    """An fl-api that predates per-job requests drops the field silently; say so instead of implying it applied."""
+    job = FLJob(id=fl_job_id, model_id=model_id, num_gpus=1)
+
+    _, logged = _start(model_id, fl_job_id, fake_session, job, {"message": "ok"})
+
+    assert any("did not report applying the GPU request" in text and not ok for text, ok in logged)
+
+
+def test_start_training_logs_nothing_about_gpus_when_flower_got_no_override(model_id, fl_job_id, fake_session):
+    reply = {"message": "ok", "resources": None, "resources_enforced": False}
+    _, logged = _start(model_id, fl_job_id, fake_session, FLJob(id=fl_job_id, model_id=model_id), reply)
+
+    assert logged == []

@@ -40,7 +40,7 @@ app, the strategy or the project config.
 ## Differential privacy: expected in the uploaded `client_app.py`
 
 `client_app.py` is **uploaded, not templated**, so this template cannot wire the privacy filter
-itself the way the NVFLARE templates do (theirs is a `task_result_filters` entry in the
+itself the way the FLARE templates do (theirs is a `task_result_filters` entry in the
 FLIP-owned `config_fed_client.json`). An uploaded Flower training app is expected to privatise its
 update by registering FLIP's DP mod on its training handler:
 
@@ -58,8 +58,8 @@ The mod clips the local update to `dp-clipping-norm` and adds Gaussian noise cal
 (`dp-epsilon`, `dp-delta`) before the reply leaves the SuperNode, and is toggled by `dp-enabled` in
 `[tool.flwr.app.config]`. See [`flip.flower.privacy`](../../../flip-utils/flip/flower/privacy.py)
 for the mechanism and the shipped tutorials for worked examples:
-[`xray_classification`](../../../fl-tutorials/flower/xray_classification/README.md) and
-[`3d_spleen_segmentation`](../../../fl-tutorials/flower/3d_spleen_segmentation/README.md).
+[`xray_classification`](../../../fl-tutorials/flower/image_classification/xray_classification/README.md) and
+[`3d_spleen_segmentation`](../../../fl-tutorials/flower/image_segmentation/3d_spleen_segmentation/README.md).
 
 > ⚠️ **This is a convention enforced by code review before upload, not by the platform.** An
 > uploaded `client_app.py` that omits the mod will train and aggregate perfectly happily while

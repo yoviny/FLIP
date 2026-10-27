@@ -14,14 +14,14 @@ limitations under the License.
 # Tutorial datasets
 
 Shared download/derive/enrich tooling for the FL tutorial datasets. Datasets are
-**backend-agnostic** — a tutorial's NVFLARE and Flower twins train on the same data — and
+**backend-agnostic** — a tutorial's FLARE and Flower twins train on the same data — and
 **many-to-one** — one dataset serves several tutorials (spleen alone backs segmentation,
 evaluation and diffusion) — so their tooling lives here once instead of duplicated per
 backend tree. Everything downloads at run time; nothing is committed.
 
 All outputs land under the shared, gitignored [`fl-tutorials/data/`](../) root, so one
-download serves both backends' harnesses (the NVFLARE simulator via each tutorial's
-`.env.app`, the Flower compose stack via `flower/run-tutorial.sh`).
+download serves both backends' harnesses (the FLARE simulator via each tutorial's
+`.env.app`, Flower's via `flower/sim-tutorial.sh`).
 
 Invoke the targets through the fl-tutorials root Makefile (which forwards here):
 
@@ -49,7 +49,7 @@ the **nnU-Net experiment plan** derived from it (target spacing, patch and batch
 normalisation, U-Net topology). `make plan` in the tutorial directory runs the planner pooled over
 every site and copies the plan into `app/nnUNetPlans_segmentation.json`, from which the app builds
 its network — see
-[`../flower/3d_prostate_segmentation/README.md`](../flower/3d_prostate_segmentation/README.md#nnu-net-plans)
+[`../flower/image_segmentation/3d_prostate_segmentation/README.md`](../flower/image_segmentation/3d_prostate_segmentation/README.md#nnu-net-plans)
 for why the plan is pooled and the measured per-center figures.
 
 | Dataset | Source | Output under `fl-tutorials/data/` | Consumed by |
@@ -58,7 +58,7 @@ for why the plan is pooled and the measured per-center figures.
 | spleen | MSD Task09_Spleen (`NUM_CASES`, default 10) | `spleen/{images/, dataframe.csv}` | 3d_spleen_segmentation + evaluation + latent_diffusion_model (**both backends**); enrichment labels |
 | spleen checkpoint | HF `aicentreflip/flip-fl-base-test-data` | `model_checkpoints/model.pt` | 3d_spleen_segmentation_evaluation |
 | brain_mri | MSD Task01_BrainTumour (`download-brain-mri-msd-raw`, 7.6 GB; `NUM_CASES` for the simulator layout) | `Task01_BrainTumour/`, `brain_mri/{images/, dataframe.csv, dicom/, source/, canonical/}` | the latent-diffusion tutorial once retargeted (FLIP#1221 follow-up); the mock trust data via `seed-brain-mri` |
-| arkplus | HF `aicentreflip/tutorials-arkplus-cxr-classification` | `arkplus/site{1,2}[,_holdoff]/` | the three Ark+ tutorials (NVFLARE) |
+| arkplus | HF `aicentreflip/tutorials-arkplus-cxr-classification` | `arkplus/site{1,2}[,_holdoff]/` | the three Ark+ tutorials (FLARE) |
 | synthea | Synthea-in-OMOP, 1k persons (AWS Open Data Registry) | `synthea/{dataframe.csv, site{1,2}/dataframe.csv}` | ehr_risk_prediction (both backends); on the platform the same data goes into each trust's OMOP via `make -C trust load-synthea-ehr` |
 | prostate | Zenodo PI-CAI + `picai_labels` (GitHub) | `prostate/{images/, labels/, zonal_labels/, clinical_information/, dicom/, nifti/, sites/<CENTER>/}` | 3d_prostate_segmentation (Flower) |
 | weights | `download.pytorch.org` (torchvision checkpoints, sha256-prefix checked; `weights/fetch_weights.py` lists them) | `weights/<torchvision filename>` (flat, e.g. `squeezenet1_1-b8a52dc0.pth`) | latent_diffusion_model via its own `make weights`, which copies the file into `app_files/` to be uploaded with the app — FL apps never download at run time (FLIP#1206) |
@@ -120,7 +120,7 @@ script imports, like the others):
 
 [`prostate/`](prostate/) owns the prostate download/preprocessing scripts. The dataset class that
 reads this data lives with the tutorial instead, at
-`../flower/3d_prostate_segmentation/app/dataset.py`, as does the nnU-Net planning step above:
+`../flower/image_segmentation/3d_prostate_segmentation/app/dataset.py`, as does the nnU-Net planning step above:
 
 - `download_data.py` — fetch the PI-CAI bpMRI images + whole-gland/zonal labels + clinical
   marksheet from Zenodo/GitHub (`FOLDS` narrows which of the 5 ~5GB fold zips to fetch).
@@ -228,6 +228,11 @@ reloads spleen; then `make -C trust seed-omop KIT=GSTT PROJECTS=cxr_project` for
 `CLEAR=1` on the PACS half. There are no volume snapshots to re-cut: since FLIP#1190 a bring-up
 seeds from the dataset at the pinned version (`make -C trust ensure-seeded`), and the projects it
 seeds by default are the ones that publish a DICOM set — spleen and brain_mri are not among them.
+
+**Moving a trust seeded before FLIP#1495.** The writer now stores slices in display order, so the
+regenerated spleen and brain_mri DICOMs changed while every UID stayed the same: a plain `seed-spleen` /
+`seed-brain-mri` gets Orthanc's `AlreadyStored` and keeps the rotated instances. Pass `CLEAR=1` once.
+Sessions already in XNAT keep the old layout until the study is pulled again.
 
 ### Brain MRI: the same chain, four MR series per study
 
